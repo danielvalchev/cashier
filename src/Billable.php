@@ -7,12 +7,13 @@ use InvalidArgumentException;
 use Stripe\Card as StripeCard;
 use Stripe\Token as StripeToken;
 use Illuminate\Support\Collection;
-use Stripe\Charge as StripeCharge;
-use Stripe\Refund as StripeRefund;
 use Stripe\Invoice as StripeInvoice;
 use Stripe\Customer as StripeCustomer;
 use Stripe\BankAccount as StripeBankAccount;
 use Stripe\InvoiceItem as StripeInvoiceItem;
+use Stripe\Error\Card as StripeCardException;
+use Stripe\PaymentIntent as StripePaymentIntent;
+use Laravel\Cashier\Exceptions\InvalidStripeCustomer;
 use Stripe\Error\InvalidRequest as StripeErrorInvalidRequest;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
@@ -20,52 +21,53 @@ use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 trait Billable
 {
     /**
-     * The Stripe API key.
-     *
-     * @var string
-     */
-    protected static $stripeKey;
-
-    /**
      * Make a "one off" charge on the customer for the given amount.
      *
      * @param  int  $amount
      * @param  array  $options
-     * @return \Stripe\Charge
+     * @return \Laravel\Cashier\Payment
      * @throws \InvalidArgumentException
      */
     public function charge($amount, array $options = [])
     {
         $options = array_merge([
+            'confirmation_method' => 'automatic',
+            'confirm' => true,
             'currency' => $this->preferredCurrency(),
         ], $options);
 
         $options['amount'] = $amount;
 
-        if (! array_key_exists('source', $options) && $this->stripe_id) {
+        if ($this->stripe_id) {
             $options['customer'] = $this->stripe_id;
         }
 
-        if (! array_key_exists('source', $options) && ! array_key_exists('customer', $options)) {
-            throw new InvalidArgumentException('No payment source provided.');
+        if (! array_key_exists('payment_method', $options) && ! array_key_exists('customer', $options)) {
+            throw new InvalidArgumentException('No payment method provided.');
         }
 
-        return StripeCharge::create($options, ['api_key' => $this->getStripeKey()]);
+        $payment = new Payment(
+            StripePaymentIntent::create($options, Cashier::stripeOptions())
+        );
+
+        $payment->validate();
+
+        return $payment;
     }
 
     /**
      * Refund a customer for a charge.
      *
-     * @param  string  $charge
+     * @param  string  $paymentIntent
      * @param  array  $options
      * @return \Stripe\Refund
      * @throws \InvalidArgumentException
      */
-    public function refund($charge, array $options = [])
+    public function refund($paymentIntent, array $options = [])
     {
-        $options['charge'] = $charge;
+        $intent = StripePaymentIntent::retrieve($paymentIntent, Cashier::stripeOptions());
 
-        return StripeRefund::create($options, ['api_key' => $this->getStripeKey()]);
+        return $intent->charges->data[0]->refund($options);
     }
 
     /**
@@ -89,9 +91,7 @@ trait Billable
      */
     public function tab($description, $amount, array $options = [])
     {
-        if (! $this->stripe_id) {
-            throw new InvalidArgumentException(class_basename($this).' is not a Stripe customer. See the createAsStripeCustomer method.');
-        }
+        $this->assertCustomerExists();
 
         $options = array_merge([
             'customer' => $this->stripe_id,
@@ -100,7 +100,7 @@ trait Billable
             'description' => $description,
         ], $options);
 
-        return StripeInvoiceItem::create($options, ['api_key' => $this->getStripeKey()]);
+        return StripeInvoiceItem::create($options, Cashier::stripeOptions());
     }
 
     /**
@@ -220,17 +220,24 @@ trait Billable
      */
     public function invoice(array $options = [])
     {
-        if ($this->stripe_id) {
-            $parameters = array_merge($options, ['customer' => $this->stripe_id]);
+        $this->assertCustomerExists();
 
-            try {
-                return StripeInvoice::create($parameters, $this->getStripeKey())->pay();
-            } catch (StripeErrorInvalidRequest $e) {
-                return false;
-            }
+        $parameters = array_merge($options, ['customer' => $this->stripe_id]);
+
+        try {
+            /** @var \Stripe\Invoice $invoice */
+            $invoice = StripeInvoice::create($parameters, Cashier::stripeOptions());
+
+            return $invoice->pay();
+        } catch (StripeErrorInvalidRequest $e) {
+            return false;
+        } catch (StripeCardException $exception) {
+            $payment = new Payment(
+                StripePaymentIntent::retrieve($invoice->refresh()->payment_intent, Cashier::stripeOptions())
+            );
+
+            $payment->validate();
         }
-
-        return true;
     }
 
     /**
@@ -240,10 +247,10 @@ trait Billable
      */
     public function upcomingInvoice()
     {
+        $this->assertCustomerExists();
+
         try {
-            $stripeInvoice = StripeInvoice::upcoming(
-                ['customer' => $this->stripe_id], ['api_key' => $this->getStripeKey()]
-            );
+            $stripeInvoice = StripeInvoice::upcoming(['customer' => $this->stripe_id], Cashier::stripeOptions());
 
             return new Invoice($this, $stripeInvoice);
         } catch (StripeErrorInvalidRequest $e) {
@@ -261,10 +268,10 @@ trait Billable
     {
         try {
             $stripeInvoice = StripeInvoice::retrieve(
-                $id, $this->getStripeKey()
+                $id, Cashier::stripeOptions()
             );
 
-            $stripeInvoice->lines = StripeInvoice::retrieve($id, $this->getStripeKey())
+            $stripeInvoice->lines = StripeInvoice::retrieve($id, Cashier::stripeOptions())
                         ->lines
                         ->all(['limit' => 1000]);
 
@@ -275,7 +282,7 @@ trait Billable
     }
 
     /**
-     * Find an invoice or throw a 404 error.
+     * Find an invoice or throw a 404 or 403 error.
      *
      * @param  string  $id
      * @return \Laravel\Cashier\Invoice
@@ -316,6 +323,8 @@ trait Billable
      */
     public function invoices($includePending = false, $parameters = [])
     {
+        $this->assertCustomerExists();
+
         $invoices = [];
 
         $parameters = array_merge(['limit' => 24], $parameters);
@@ -355,6 +364,8 @@ trait Billable
      */
     public function cards($parameters = [])
     {
+        $this->assertCustomerExists();
+
         $cards = [];
 
         $parameters = array_merge(['limit' => 24], $parameters);
@@ -400,9 +411,11 @@ trait Billable
      */
     public function updateCard($token)
     {
+        $this->assertCustomerExists();
+
         $customer = $this->asStripeCustomer();
 
-        $token = StripeToken::retrieve($token, ['api_key' => $this->getStripeKey()]);
+        $token = StripeToken::retrieve($token, Cashier::stripeOptions());
 
         // If the given token already has the card as their default source, we can just
         // bail out of the method now. We don't need to keep adding the same card to
@@ -491,6 +504,8 @@ trait Billable
      */
     public function applyCoupon($coupon)
     {
+        $this->assertCustomerExists();
+
         $customer = $this->asStripeCustomer();
 
         $customer->coupon = $coupon;
@@ -546,6 +561,20 @@ trait Billable
     }
 
     /**
+     * Determine if the entity has a Stripe customer ID and throw an exception if not.
+     *
+     * @return void
+     *
+     * @throws \Laravel\Cashier\Exceptions\InvalidStripeCustomer
+     */
+    protected function assertCustomerExists()
+    {
+        if (! $this->stripe_id) {
+            throw InvalidStripeCustomer::nonCustomer($this);
+        }
+    }
+
+    /**
      * Create a Stripe customer for the given model.
      *
      * @param  array  $options
@@ -561,7 +590,7 @@ trait Billable
         // user from Stripe. This ID will correspond with the Stripe user instances
         // and allow us to retrieve users from Stripe later when we need to work.
         $customer = StripeCustomer::create(
-            $options, $this->getStripeKey()
+            $options, Cashier::stripeOptions()
         );
 
         $this->stripe_id = $customer->id;
@@ -579,11 +608,24 @@ trait Billable
      */
     public function updateStripeCustomer(array $options = [])
     {
-        $customer = StripeCustomer::update(
-            $this->stripe_id, $options, $this->getStripeKey()
+        return StripeCustomer::update(
+            $this->stripe_id, $options, Cashier::stripeOptions()
         );
+    }
 
-        return $customer;
+    /**
+     * Get the Stripe customer instance for the current user and token.
+     *
+     * @param  array  $options
+     * @return \Stripe\Customer
+     */
+    public function createOrGetStripeCustomer(array $options = [])
+    {
+        if ($this->stripe_id) {
+            return $this->asStripeCustomer();
+        }
+
+        return $this->createAsStripeCustomer($options);
     }
 
     /**
@@ -593,7 +635,7 @@ trait Billable
      */
     public function asStripeCustomer()
     {
-        return StripeCustomer::retrieve($this->stripe_id, $this->getStripeKey());
+        return StripeCustomer::retrieve($this->stripe_id, Cashier::stripeOptions());
     }
 
     /**
@@ -614,34 +656,5 @@ trait Billable
     public function taxPercentage()
     {
         return 0;
-    }
-
-    /**
-     * Get the Stripe API key.
-     *
-     * @return string
-     */
-    public static function getStripeKey()
-    {
-        if (static::$stripeKey) {
-            return static::$stripeKey;
-        }
-
-        if ($key = getenv('STRIPE_SECRET')) {
-            return $key;
-        }
-
-        return config('services.stripe.secret');
-    }
-
-    /**
-     * Set the Stripe API key.
-     *
-     * @param  string  $key
-     * @return void
-     */
-    public static function setStripeKey($key)
-    {
-        static::$stripeKey = $key;
     }
 }

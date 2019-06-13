@@ -5,16 +5,20 @@ namespace Laravel\Cashier\Http\Controllers;
 use Illuminate\Support\Str;
 use Illuminate\Http\Request;
 use Laravel\Cashier\Cashier;
+use Laravel\Cashier\Payment;
 use Illuminate\Support\Carbon;
 use Laravel\Cashier\Subscription;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\Mail;
+use Laravel\Cashier\Mail\ConfirmPayment;
 use Symfony\Component\HttpFoundation\Response;
+use Stripe\PaymentIntent as StripePaymentIntent;
 use Laravel\Cashier\Http\Middleware\VerifyWebhookSignature;
 
 class WebhookController extends Controller
 {
     /**
-     * Create a new webhook controller instance.
+     * Create a new WebhookController instance.
      *
      * @return void
      */
@@ -51,9 +55,7 @@ class WebhookController extends Controller
      */
     protected function handleCustomerSubscriptionUpdated(array $payload)
     {
-        $user = $this->getUserByStripeId($payload['data']['object']['customer']);
-
-        if ($user) {
+        if ($user = $this->getUserByStripeId($payload['data']['object']['customer'])) {
             $data = $payload['data']['object'];
 
             $user->subscriptions->filter(function (Subscription $subscription) use ($data) {
@@ -85,6 +87,15 @@ class WebhookController extends Controller
                                 : Carbon::createFromTimestamp($data['current_period_end']);
                 }
 
+                // Status...
+                if (isset($data['status'])) {
+                    if (in_array($data['status'], ['past_due', 'incomplete', 'incomplete_expired'])) {
+                        $subscription->status = 'incomplete';
+                    } else {
+                        $subscription->status = 'active';
+                    }
+                }
+
                 $subscription->save();
             });
         }
@@ -100,9 +111,7 @@ class WebhookController extends Controller
      */
     protected function handleCustomerSubscriptionDeleted(array $payload)
     {
-        $user = $this->getUserByStripeId($payload['data']['object']['customer']);
-
-        if ($user) {
+        if ($user = $this->getUserByStripeId($payload['data']['object']['customer'])) {
             $user->subscriptions->filter(function ($subscription) use ($payload) {
                 return $subscription->stripe_id === $payload['data']['object']['id'];
             })->each(function ($subscription) {
@@ -151,9 +160,7 @@ class WebhookController extends Controller
      */
     protected function handleCustomerDeleted(array $payload)
     {
-        $user = $this->getUserByStripeId($payload['data']['object']['id']);
-
-        if ($user) {
+        if ($user = $this->getUserByStripeId($payload['data']['object']['id'])) {
             $user->subscriptions->each(function (Subscription $subscription) {
                 $subscription->skipTrial()->markAsCancelled();
             });
@@ -164,6 +171,26 @@ class WebhookController extends Controller
                 'card_brand' => null,
                 'card_last_four' => null,
             ])->save();
+        }
+
+        return new Response('Webhook Handled', 200);
+    }
+
+    /**
+     * Handle payment action required for invoice.
+     *
+     * @param  array $payload
+     * @return \Symfony\Component\HttpFoundation\Response
+     */
+    protected function handleInvoicePaymentActionRequired(array $payload)
+    {
+        if (Cashier::$paymentConfirmationEmails &&
+            $user = $this->getUserByStripeId($payload['data']['object']['customer'])) {
+            $payment = new Payment(
+                StripePaymentIntent::retrieve($payload['data']['object']['payment_intent'], Cashier::stripeOptions())
+            );
+
+            Mail::to($user)->send(new ConfirmPayment($user, $payment));
         }
 
         return new Response('Webhook Handled', 200);
